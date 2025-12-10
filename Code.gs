@@ -10,114 +10,172 @@
  * @customfunction
  */
 function SQLJOIN(left_range, right_range, left_columns, right_columns, join_type, has_header) {
-  var params = validateJoinParameters(left_range, right_range, left_columns, right_columns, join_type, has_header);
+  // 0. Handle default run case 
+  if (left_range === undefined && right_range === undefined && left_columns === undefined && right_columns === undefined && join_type === undefined && has_header === undefined)
+    return null;
 
-  if (!params) {
-    return [];
-  }
+  // 1. Validate and normalize join_type parameter
+  var normalizedJoinType = validateAndNormalizeJoinType(join_type);
 
-  return performHashedJoin(params.data1, params.data2, params.col1ZeroIndexes, params.col2ZeroIndexes, params.joinType, params.hasHeader);
+  // 2. Validate and normalize column indexes
+  var normalizedColumns = validateAndNormalizeColumnIndexes(left_columns, right_columns);
+
+  // 3. Validate and normalize range parameters
+  var normalizedRanges = validateAndNormalizeRanges(
+    left_range,
+    right_range,
+    normalizedColumns.col1Indexes,
+    normalizedColumns.col2Indexes,
+    has_header
+  );
+
+  return performHashedJoin(
+    normalizedRanges.left_range,
+    normalizedRanges.right_range,
+    normalizedColumns.col1ZeroIndexes,
+    normalizedColumns.col2ZeroIndexes,
+    normalizedJoinType,
+    has_header || true);
 }
 
 /**
- * Validates and normalizes the input parameters for SQLJOIN
- * @param {Range|Array} left_range - First range to join
- * @param {Range|Array} right_range - Second range to join
- * @param {number|Array} left_columns - Column index(es) in left_range to match on (1-based)
- * @param {number|Array} right_columns - Column index(es) in right_range to match on (1-based)
- * @param {string} join_type - Type of join (INNER, LEFT). Defaults to INNER if not specified
- * @param {boolean} has_header - Whether the ranges have header rows. Defaults to true
- * @returns {Object|null} Normalized parameters object or null if validation fails
+ * Validates and normalizes the join type parameter
+ * @param {string} join_type - Type of join (INNER, LEFT)
+ * @returns {string} Normalized join type in uppercase
+ * @throws {Error} If join type is not supported
  */
-function validateJoinParameters(left_range, right_range, left_columns, right_columns, join_type, has_header) {
-  if (!left_range || !right_range || !left_columns || !right_columns) {
-    return null;
-  }
-
-  // Validate join_type parameter
+function validateAndNormalizeJoinType(join_type) {
   join_type = join_type || 'INNER';
   join_type = join_type.toUpperCase();
+
   if (join_type !== 'INNER' && join_type !== 'LEFT') {
-    return null;
+    throw new Error(`Unsupported join_type parameters. Expected: 'INNER', 'LEFT'; Got: '${join_type}'`);
   }
 
-  // Convert single indexes to arrays for uniform handling
+  return join_type;
+}
+
+/**
+ * Validates and normalizes column index parameters
+ * @param {number|Array} left_columns - Column index(es) for left range
+ * @param {number|Array} right_columns - Column index(es) for right range
+ * @returns {Object} Object containing validated 1-based and 0-based column indexes
+ * @throws {Error} If column indexes are invalid
+ */
+function validateAndNormalizeColumnIndexes(left_columns, right_columns) {
+  // Convert single indexes to arrays
   var col1Indexes = Array.isArray(left_columns) ? left_columns[0] : [left_columns];
   var col2Indexes = Array.isArray(right_columns) ? right_columns[0] : [right_columns];
 
   // Validate that both arrays have the same length
   if (col1Indexes.length !== col2Indexes.length) {
-    return null;
+    throw new Error(`left_columns and right_columns parameters must contain the same number of elements, Got: left_columns=${col1Indexes}, right_columns=${col2Indexes}`);
   }
 
-  if (typeof left_range.getValues === 'function') {
-    data1 = left_range.getValues();
-  }
-  else {
-    data1 = left_range;
+  // Check for empty column arrays
+  if (col1Indexes.length === 0 || col2Indexes.length === 0) {
+    throw new Error("Column indexes cannot be empty. You must specify at least one column to join on.");
   }
 
+  // Validate types and check for duplicates
+  var col1Set = new Set();
+  var col2Set = new Set();
 
-  if (typeof right_range.getValues === 'function') {
-    data2 = right_range.getValues();
-  }
-  else {
-    data2 = leright_rangeft_range;
+  for (var i = 0; i < col1Indexes.length; i++) {
+    if (!Number.isInteger(col1Indexes[i])) {
+      throw new Error(`left_columns contains non integer value(s): Got '${col1Indexes[i]}' at the ${i} position`)
+    }
+    if (!Number.isInteger(col2Indexes[i])) {
+      throw new Error(`right_columns contains non integer value(s): Got '${col2Indexes[i]}' at the ${i} position`)
+    }
+
+    // Check for duplicate columns in join keys
+    if (col1Set.has(col1Indexes[i])) {
+      throw new Error(`left_columns contains duplicate column index: ${col1Indexes[i]}`);
+    }
+    if (col2Set.has(col2Indexes[i])) {
+      throw new Error(`right_columns contains duplicate column index: ${col2Indexes[i]}`);
+    }
+
+    col1Set.add(col1Indexes[i]);
+    col2Set.add(col2Indexes[i]);
   }
 
-  if (!Array.isArray(data1) || !Array.isArray(data2)) {
-    return null;
+  // Check for minimum column bounds (should be at least 1)
+  if (Math.min(...col1Indexes) < 1 || Math.min(...col2Indexes) < 1) {
+    throw new Error("Column indexes must be positive integers starting from 1 (1-based indexing).");
   }
 
-  if (data1.length === 0 || data2.length === 0) {
-    return null;
+  // Convert to 0-based indexes
+  var col1ZeroIndexes = col1Indexes.map(idx => idx - 1);
+  var col2ZeroIndexes = col2Indexes.map(idx => idx - 1);
+
+  return {
+    col1Indexes: col1Indexes,
+    col2Indexes: col2Indexes,
+    col1ZeroIndexes: col1ZeroIndexes,
+    col2ZeroIndexes: col2ZeroIndexes
+  };
+}
+
+/**
+ * Validates and normalizes range parameters
+ * @param {Array} left_range - First range to join
+ * @param {Array} right_range - Second range to join
+ * @param {Array} col1Indexes - Column indexes for left range (1-based)
+ * @param {Array} col2Indexes - Column indexes for right range (1-based)
+ * @param {boolean} has_header - Whether ranges have header rows
+ * @returns {Object} Object containing validated and truncated ranges
+ * @throws {Error} If ranges are invalid
+ */
+function validateAndNormalizeRanges(left_range, right_range, col1Indexes, col2Indexes, has_header) {
+  // Basic type validation
+  if (!Array.isArray(left_range) || !Array.isArray(right_range)) {
+    throw new Error("left_range and right_range parameters MUST be ranges.")
+  }
+
+  if (left_range.length === 0 || right_range.length === 0) {
+    throw new Error("left_range and right_range parameters MUST be non-empty ranges. Check your formula")
+  }
+
+  // Truncate empty rows and columns from both ranges
+  left_range = truncateEmptyRowsAndColumns(left_range);
+  right_range = truncateEmptyRowsAndColumns(right_range);
+
+  // Check that ranges are not completely empty after truncation
+  if (left_range.length === 0 || left_range[0].length === 0) {
+    throw new Error("left_range contains only empty values after removing trailing empty rows/columns.");
+  }
+
+  if (right_range.length === 0 || right_range[0].length === 0) {
+    throw new Error("right_range contains only empty values after removing trailing empty rows/columns.");
   }
 
   // Check that all rows in each range have same number of columns
-  var row1Length = data1[0].length;
-  var row2Length = data2[0].length;
+  var row1Length = left_range[0].length;
+  var row2Length = right_range[0].length;
 
-  for (var i = 0; i < data1.length; i++) {
-    if (data1[i].length !== row1Length) {
-      return null;
-    }
-  }
+  var isLeftRangeValid = left_range.every(row => row.length === row1Length);
+  var isRightRangeValid = right_range.every(row => row.length === row2Length);
 
-  for (var i = 0; i < data2.length; i++) {
-    if (data2[i].length !== row2Length) {
-      return null;
-    }
+  if (!isLeftRangeValid || !isRightRangeValid) {
+    throw new Error("All rows in each range must have the same number of columns. Check for irregular data in your ranges.");
   }
 
   // Validate column indexes are within bounds
   if (Math.max(...col1Indexes) > row1Length || Math.max(...col2Indexes) > row2Length) {
-    return null;
+    throw new Error(`Column indexes are out of bounds. left_range has ${row1Length} columns, right_range has ${row2Length} columns. Check left_columns and right_columns parameters.`);
   }
 
-
-  // Convert to 0-based indexes and validate
-  var col1ZeroIndexes = [];
-  var col2ZeroIndexes = [];
-
-  for (var k = 0; k < col1Indexes.length; k++) {
-    var idx1 = col1Indexes[k] - 1;
-    var idx2 = col2Indexes[k] - 1;
-
-    if (idx1 < 0 || idx2 < 0) {
-      return null;
-    }
-
-    col1ZeroIndexes.push(idx1);
-    col2ZeroIndexes.push(idx2);
+  // Check that ranges have enough rows (at least header if has_header is true)
+  var minRows = (has_header || true) ? 1 : 0;
+  if (left_range.length <= minRows || right_range.length <= minRows) {
+    throw new Error(`Ranges must contain data rows${(has_header || true) ? ' in addition to the header row' : ''}. One or both ranges only contain header/empty data.`);
   }
 
   return {
-    data1: data1,
-    data2: data2,
-    col1ZeroIndexes: col1ZeroIndexes,
-    col2ZeroIndexes: col2ZeroIndexes,
-    joinType: join_type,
-    hasHeader: has_header || true
+    left_range: left_range,
+    right_range: right_range
   };
 }
 
@@ -128,13 +186,9 @@ function validateJoinParameters(left_range, right_range, left_columns, right_col
  * @returns {string} Composite key string
  */
 function createCompositeKey(row, columnIndexes) {
-  var keyParts = [];
-  for (var i = 0; i < columnIndexes.length; i++) {
-    var value = row[columnIndexes[i]];
-    // Convert to string and escape delimiter to handle edge cases
-    keyParts.push(String(value));
-  }
-  return keyParts.join('\u001E');
+  return columnIndexes
+    .map(idx => String(row[idx]))
+    .join('\u001E');
 }
 
 /**
@@ -155,9 +209,7 @@ function performHashedJoin(data1, data2, col1ZeroIndexes, col2ZeroIndexes, joinT
   // Handle header row
   if (hasHeader && data1.length > 0 && data2.length > 0) {
     var headerRow1 = data1[0];
-    var headerRow2 = data2[0].filter(function (_, index) {
-      return col2ZeroIndexes.indexOf(index) === -1;
-    });
+    var headerRow2 = data2[0].filter((_, index) => !col2ZeroIndexes.includes(index));
     result.push(headerRow1.concat(headerRow2));
   }
 
@@ -176,10 +228,8 @@ function performHashedJoin(data1, data2, col1ZeroIndexes, col2ZeroIndexes, joinT
       hashTable[key] = [];
     }
 
-    // Store filtered row (without join columns) and original index
-    var filteredRow2 = row2.filter(function (_, index) {
-      return col2ZeroIndexes.indexOf(index) === -1;
-    });
+    // Store filtered row (without join columns)
+    var filteredRow2 = row2.filter((_, index) => !col2ZeroIndexes.includes(index));
 
     hashTable[key].push(filteredRow2);
   }
@@ -198,14 +248,66 @@ function performHashedJoin(data1, data2, col1ZeroIndexes, col2ZeroIndexes, joinT
       }
     } else if (joinType === 'LEFT') {
       // Handle unmatched rows for LEFT join
-      var nullValues = [];
-      for (var n = 0; n < filteredData2Columns; n++) {
-        nullValues.push(null);
-      }
+      var nullValues = new Array(filteredData2Columns).fill(null);
       var combinedRow = row1.concat(nullValues);
       result.push(combinedRow);
     }
   }
 
   return result;
+}
+
+/**
+ * Finds the last row index that contains at least one non-empty value
+ * @param {Array} range - 2D array representing the range
+ * @returns {number} Last non-empty row index, or -1 if all rows are empty
+ */
+function findLastNonEmptyRow(range) {
+  return range.findLastIndex(row => row.some(cell => cell !== ''));
+}
+
+/**
+ * Finds the last column index that contains at least one non-empty value
+ * @param {Array} range - 2D array representing the range
+ * @returns {number} Last non-empty column index, or -1 if all columns are empty
+ */
+function findLastNonEmptyColumn(range) {
+  if (range.length === 0) return -1;
+
+  var maxColIndex = range[0].length - 1;
+
+  for (var colIdx = maxColIndex; colIdx >= 0; colIdx--) {
+    var hasNonEmpty = range.some(row => row[colIdx] !== '');
+    if (hasNonEmpty) {
+      return colIdx;
+    }
+  }
+
+  return -1;
+}
+
+/**
+ * Truncates a range by removing trailing empty rows and columns
+ * @param {Array} range - 2D array representing the range
+ * @returns {Array} Truncated range
+ */
+function truncateEmptyRowsAndColumns(range) {
+  if (!range || range.length === 0) return range;
+
+  var lastRowIdx = findLastNonEmptyRow(range);
+  if (lastRowIdx === -1) return [[]];
+
+
+  var lastRowIdx = findLastNonEmptyRow(range);
+  if (lastRowIdx === -1) return [[]];
+  var truncatedRows = range.slice(0, lastRowIdx + 1);
+  var truncatedRows = range.slice(0, lastRowIdx + 1);
+
+
+  var truncatedRows = range.slice(0, lastRowIdx + 1);
+
+  var lastColIdx = findLastNonEmptyColumn(truncatedRows);
+  if (lastColIdx === -1) return [[]];
+
+  return truncatedRows.map(row => row.slice(0, lastColIdx + 1));
 }
